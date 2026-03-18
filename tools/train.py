@@ -1,0 +1,163 @@
+import os
+import sys
+import yaml
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision.models import resnet18, ResNet18_Weights
+
+# 添加项目根目录到 sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models.prm_detr import PRMDETR
+from models.neck.hybrid_encoder_prm import HybridEncoderPRM
+from models.head.prm_decoder import PRMDecoder
+from engine.matcher import PointMatcher
+from engine.criterion import PointCriterion
+from utils.metrics import PointEvaluator
+from dataset import build_dataloader
+
+class ResNetBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 使用预训练的 ResNet18 作为轻量级 Backbone (不下载权重，随机初始化)
+        resnet = resnet18(weights=None)
+        self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+    def forward(self, x):
+        features = []
+        x = self.stem(x)
+        x = self.layer1(x)
+        features.append(x)  # P2: [B, 64, H/4, W/4]
+        x = self.layer2(x)
+        features.append(x)  # P3: [B, 128, H/8, W/8]
+        x = self.layer3(x)
+        features.append(x)  # P4: [B, 256, H/16, W/16]
+        x = self.layer4(x)
+        features.append(x)  # P5: [B, 512, H/32, W/32]
+        return features
+
+def main():
+    # 1. 解析配置
+    config_path = 'configs/dataset/visdrone_point.yml'
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+        
+    print(f"Loaded config from {config_path}")
+    
+    # 手动注入 batch_size
+    if 'batch_size' not in config:
+        config['batch_size'] = 8
+    
+    # 2. 设备设置
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # 3. 构建 DataLoader
+    print("Building DataLoaders...")
+    train_loader = build_dataloader(config, is_train=True)
+    val_loader = build_dataloader(config, is_train=False)
+    print(f"Train loader size: {len(train_loader)}, Val loader size: {len(val_loader)}")
+
+    # 4. 实例化模型组件
+    backbone = ResNetBackbone()
+    neck = HybridEncoderPRM(in_channels_list=[64, 128, 256, 512], hidden_dim=256)
+    # 将 num_queries 提高到 200，以适应 VisDrone 中密集的小目标
+    head = PRMDecoder(num_classes=config['num_classes'], hidden_dim=256, num_queries=200)
+    model = PRMDETR(backbone, neck, head).to(device)
+
+    # 5. 实例化损失函数
+    matcher = PointMatcher()
+    weight_dict = {"loss_ce": 1.0, "loss_point": 5.0}
+    criterion = PointCriterion(num_classes=config['num_classes'], matcher=matcher, weight_dict=weight_dict).to(device)
+
+    # 6. 设置优化器
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    torch.backends.cudnn.benchmark = True # 开启底层加速
+    
+    # 初始化验证器
+    evaluator = PointEvaluator(distance_thresholds=[0.01, 0.05, 0.1])
+
+    # 7. 运行训练循环
+    num_epochs = 10
+    print(f"Starting training loop for {num_epochs} epochs...")
+    
+    for epoch in range(1, num_epochs + 1):
+        # --- 训练阶段 ---
+        model.train()
+        criterion.train()
+        total_train_loss = 0
+        
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            # 数据迁移到 device
+            images = images.to(device)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            optimizer.zero_grad()
+            
+            # 🚀 1. 纯 FP32 前向传播 (原汁原味，绝不溢出)
+            outputs = model(images)
+            loss_dict = criterion(outputs, targets)
+            total_loss = sum(loss_dict.values())
+            
+            # 🚀 2. 反向传播求导
+            total_loss.backward()
+            
+            # 🚀 3. 🚨 必须保留！极其重要的 DETR 梯度裁剪防爆神器
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            
+            # 🚀 4. 更新权重
+            optimizer.step()
+                       
+            total_train_loss += total_loss.item()
+            
+            # 打印日志
+            if batch_idx % 50 == 0:
+                loss_ce = loss_dict['loss_ce'].item()
+                loss_point = loss_dict['loss_point'].item()
+                print(f"Epoch [{epoch}/{num_epochs}][{batch_idx}/{len(train_loader)}] | loss_ce: {loss_ce:.4f} | loss_point: {loss_point:.4f} | Total: {total_loss.item():.4f}")
+        
+        avg_train_loss = total_train_loss / len(train_loader)
+        print(f"Epoch {epoch} finished. Avg Train Loss: {avg_train_loss:.4f}")
+        
+        # --- 验证阶段 ---
+        print("Running validation...")
+        model.eval()
+        evaluator.reset()
+        
+        with torch.no_grad():
+            for batch_idx, (images, targets) in enumerate(val_loader):
+                images = images.to(device)
+                outputs = model(images)
+                pred_logits = outputs['pred_logits']
+                pred_points = outputs['pred_points']
+                
+                bs = images.shape[0]
+                for i in range(bs):
+                    probs = pred_logits[i].sigmoid()
+                    scores, _ = probs.max(dim=-1)
+                    points = pred_points[i]
+                    
+                    # 确保真实标签也放在显卡上，否则后面计算距离会报错
+                    gt_points = targets[i]['points'].to(device)
+                    
+                    # 过滤低分预测加速评估
+                    keep = scores > 0.05
+                    evaluator.update(
+                        pred_points=points[keep],
+                        pred_scores=scores[keep],
+                        gt_points=gt_points
+                    )
+                    
+        # 累积并打印指标
+        evaluator.accumulate()
+        print("-" * 50)
+
+    print("Training loop finished successfully!")
+
+if __name__ == "__main__":
+    main()

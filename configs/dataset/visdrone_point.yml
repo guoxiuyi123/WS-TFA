@@ -1,0 +1,6 @@
+# VisDrone Dataset for Point Supervision 
+num_classes: 10 
+train_img_dir: '/home/pc/gxy/dataset/VisDrone2019/VisDrone2019/VisDrone2019-DET-train/images' 
+train_label_dir: '/home/pc/gxy/dataset/VisDrone2019/VisDrone2019/VisDrone2019-DET-train/point_labels' 
+val_img_dir: '/home/pc/gxy/dataset/VisDrone2019/VisDrone2019/VisDrone2019-DET-val/images' 
+val_label_dir: '/home/pc/gxy/dataset/VisDrone2019/VisDrone2019/VisDrone2019-DET-val/point_labels'
