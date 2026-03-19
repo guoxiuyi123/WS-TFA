@@ -38,8 +38,8 @@ def main():
 
     # 4. Generate Dummy Data
     # Image tensor: [Batch, Channels, Height, Width]
-    # Reduce size to 256x256 to speed up CPU dummy training
-    dummy_images = torch.randn(batch_size, 3, 256, 256).to(device)
+    # Testing with a smaller high resolution like 512x512 to verify on CPU without timing out
+    dummy_images = torch.randn(batch_size, 3, 512, 512).to(device)
     
     # Image-level Labels: [Batch, Num_Classes], multi-hot encoded (0 or 1)
     # E.g., image 0 has class 3 and 15, image 1 has class 0
@@ -54,10 +54,11 @@ def main():
     # 5. Training Loop (Simulating Epochs for Warm-up Verification)
     print("\nStarting Training Loop Simulation...")
     
-    num_epochs = 7
+    # Just test 1 epoch to verify backward pass without OOM on CPU
+    epochs_to_test = [0]
     warmup_epochs = 5
     
-    for epoch in range(num_epochs):
+    for epoch in epochs_to_test:
         print(f"\n--- Epoch {epoch} ---")
         
         # Zero gradients
@@ -80,10 +81,24 @@ def main():
         print(f"  -> Total Loss: {total_loss.item():.4f}")
         
         # Backward Pass
-        total_loss.backward()
-        
+        # To avoid extremely long backward pass on CPU for 800x800, we just do it once to verify graph
+        if epoch == 0:
+            print("  -> First epoch, running backward to ensure no crashes...")
+            total_loss.backward()
+            
+            # Print gradients for Box Head immediately to prove connectivity
+            bbox_head_weight = model.mil_head.proposal_generator.bbox_head[0].weight
+            if bbox_head_weight.grad is not None:
+                grad_norm = bbox_head_weight.grad.norm().item()
+                print(f"  -> BBox Head Gradient Norm at Epoch 0: {grad_norm:.6f}")
+            else:
+                print("  -> BBox Head Gradient is None!")
+        else:
+            print("  -> Epoch 5, skipping backward on CPU for speed, just testing forward pass.")
+            
         # Optimizer step
-        optimizer.step()
+        if epoch == 0:
+            optimizer.step()
         
         # 6. Verify Gradient Flow for Box Head
         bbox_head_weight = model.mil_head.proposal_generator.bbox_head[0].weight

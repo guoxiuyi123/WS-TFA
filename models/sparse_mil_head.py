@@ -4,10 +4,54 @@ Combines a Class-Agnostic DETR-like proposal generator with a Sparsemax-based
 MIL classifier to suppress local dominance and filter noisy proposals.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
+
+class PositionEmbeddingSine(nn.Module):
+    """
+    Standard 2D Sine Positional Encoding.
+    """
+    def __init__(self, num_pos_feats=128, temperature=10000, normalize=False, scale=None):
+        super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+        if scale is None:
+            scale = 2 * math.pi
+        self.scale = scale
+
+    def forward(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mask (torch.Tensor): [B, H, W] boolean mask (False means valid spatial location).
+        Returns:
+            torch.Tensor: [B, C, H, W] positional embedding.
+        """
+        assert mask is not None
+        not_mask = ~mask
+        y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if self.normalize:
+            eps = 1e-6
+            y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
+            x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=mask.device)
+        dim_t = self.temperature ** (2 * (torch.div(dim_t, 2, rounding_mode='floor')) / self.num_pos_feats)
+
+        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, None] / dim_t
+        
+        # Interleave sin and cos
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
+        return pos
 
 class Sparsemax(nn.Module):
     """
@@ -80,7 +124,7 @@ class ClassAgnosticDETR(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 256, num_queries: int = 300, nheads: int = 8,
-                 num_encoder_layers: int = 2, num_decoder_layers: int = 2):
+                 num_encoder_layers: int = 2, num_decoder_layers: int = 2, num_feature_levels: int = 4):
         super().__init__()
         self.num_queries = num_queries
         self.hidden_dim = hidden_dim
@@ -99,6 +143,13 @@ class ClassAgnosticDETR(nn.Module):
 
         # Learnable Object Queries
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        
+        # Scale-level embeddings to distinguish features from different FPN levels
+        self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, hidden_dim))
+        nn.init.normal_(self.level_embed)
+        
+        # 2D Positional Encoding
+        self.pos_embed = PositionEmbeddingSine(num_pos_feats=hidden_dim // 2, normalize=True)
 
         # Prediction Heads (Class Agnostic)
         # 1. Bounding Box Head (4 coordinates: cx, cy, w, h)
@@ -119,11 +170,11 @@ class ClassAgnosticDETR(nn.Module):
             nn.Sigmoid() # Probability score
         )
 
-    def forward(self, features: torch.Tensor, pos_embed: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, features: torch.Tensor, spatial_shapes: List[Tuple[int, int]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             features (torch.Tensor): Flattened feature maps [B, Seq_Len, C]
-            pos_embed (torch.Tensor): Optional positional embeddings
+            spatial_shapes (List[Tuple[int, int]]): Shapes of features from each level
             
         Returns:
             bboxes: [B, num_queries, 4]
@@ -132,6 +183,25 @@ class ClassAgnosticDETR(nn.Module):
         """
         B = features.size(0)
         
+        # Prepare position embeddings and scale embeddings
+        pos_embeds = []
+        for level, (H, W) in enumerate(spatial_shapes):
+            # Create a dummy mask [B, H, W] with False (meaning valid)
+            mask = torch.zeros((B, H, W), dtype=torch.bool, device=features.device)
+            # Generate 2D sine positional embedding: [B, C, H, W]
+            pos = self.pos_embed(mask)
+            # Flatten to [B, H*W, C]
+            pos = pos.flatten(2).permute(0, 2, 1)
+            # Add scale-level embedding
+            pos = pos + self.level_embed[level].view(1, 1, -1)
+            pos_embeds.append(pos)
+            
+        # Concatenate positional embeddings
+        pos_embeds = torch.cat(pos_embeds, dim=1) # [B, Seq_Len, C]
+        
+        # Add pos_embed to features before Transformer Encoder
+        features_with_pos = features + pos_embeds
+        
         # Prepare queries [B, num_queries, hidden_dim]
         query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
         # Dummy target for decoder (initialized to zeros)
@@ -139,9 +209,7 @@ class ClassAgnosticDETR(nn.Module):
 
         # Transformer Forward Pass
         # Encoder takes features, Decoder takes queries
-        # Note: In a full DETR, spatial features require flattening and pos embeddings.
-        # Here we assume 'features' is already [B, Seq_Len, C]
-        memory = self.transformer.encoder(features)
+        memory = self.transformer.encoder(features_with_pos)
         hs = self.transformer.decoder(tgt, memory, tgt_key_padding_mask=None, memory_key_padding_mask=None)
         
         # Generate predictions
@@ -176,16 +244,17 @@ class SparseMILHead(nn.Module):
         # forcing low-confidence queries to 0.
         self.sparsemax = Sparsemax(dim=1)
 
-    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, features: torch.Tensor, spatial_shapes: List[Tuple[int, int]]) -> Dict[str, torch.Tensor]:
         """
         Args:
             features (torch.Tensor): Flattened multi-scale features [B, Seq_Len, C]
+            spatial_shapes (List[Tuple[int, int]]): Shapes of features from each level
             
         Returns:
             Dict containing final probabilities, objectness, bboxes, and sparse mil probs.
         """
         # 1. Generate Class-Agnostic Proposals
-        bboxes, objectness_scores, hs = self.proposal_generator(features)
+        bboxes, objectness_scores, hs = self.proposal_generator(features, spatial_shapes)
         # hs shape: [B, 300, 256]
         # objectness_scores shape: [B, 300, 1]
 
@@ -219,13 +288,14 @@ if __name__ == '__main__':
     
     # Dummy flattened features (e.g., from P5 or concatenated FPN levels)
     dummy_features = torch.randn(B, Seq_Len, C)
+    spatial_shapes = [(10, 10), (10, 10), (10, 10), (10, 10)] # Mock spatial shapes
     print(f"Input Features Shape: {dummy_features.shape}")
 
     # Instantiate Head
     mil_head = SparseMILHead(num_classes=Num_Classes, hidden_dim=C, num_queries=Num_Queries)
     
     # Forward Pass
-    outputs = mil_head(dummy_features)
+    outputs = mil_head(dummy_features, spatial_shapes)
     
     bboxes = outputs["bboxes"]
     obj_scores = outputs["objectness_scores"]

@@ -29,6 +29,10 @@ class WSTFALoss(nn.Module):
         self.box_loss_weight = box_loss_weight
         self.top_k_pseudo = top_k_pseudo
         
+        # BCEWithLogitsLoss is generally more numerically stable than BCELoss
+        # but requires raw logits. Since final_prob is bounded [0,1], we can stick
+        # to BCELoss or use an epsilon clamp. For WSOD, aggregating over all proposals
+        # and then applying BCE is standard.
         self.bce_loss = nn.BCELoss(reduction='mean')
         self.l1_loss = nn.L1Loss(reduction='mean')
 
@@ -65,7 +69,8 @@ class WSTFALoss(nn.Module):
         # 1. MIL Loss (Image-Level Classification)
         # ==========================================
         # Aggregate proposal-level probabilities to image-level probabilities using Sum Pooling.
-        image_level_preds = torch.clamp(final_prob.sum(dim=1), min=0.0, max=1.0) # [B, num_classes]
+        # We clamp to [1e-6, 1.0 - 1e-6] to avoid log(0) in BCE.
+        image_level_preds = torch.clamp(final_prob.sum(dim=1), min=1e-6, max=1.0 - 1e-6) # [B, num_classes]
         mil_loss = self.bce_loss(image_level_preds, image_labels.float())
 
         # ==========================================
@@ -100,43 +105,18 @@ class WSTFALoss(nn.Module):
                     # These are our "Pseudo GTs" for this class
                     topk_scores, topk_indices = torch.topk(cls_scores, k=self.top_k_pseudo)
                     
-                    # In a real WSOD scenario, since we only have image-level labels, 
-                    # we use the top scoring proposal to supervise ITSELF or OTHER spatially close proposals.
-                    # A common technique (OICR/PCL) is to use the top-scoring box as the pseudo-GT,
-                    # and push other highly overlapping boxes to regress towards it.
-                    # For DETR queries, we can supervise the selected query to regress towards its current prediction 
-                    # (which acts as an anchor), or we can just compute loss between it and itself? 
-                    # Wait, if we use L1 loss between a prediction and itself, gradient is zero.
-                    # We need a stop-gradient!
-                    # The pseudo GT box should be detached from the computation graph.
-                    
-                    # We treat the currently predicted box of the top-k queries as the "Pseudo GT" 
-                    # BUT detached from the graph. Then we calculate loss for these queries against the detached boxes.
-                    # This encourages the queries to confidently converge to these locations.
-                    # Alternatively, if we have multiple queries predicting the same object, 
-                    # we can force the top K queries to regress to the absolute highest scoring query.
-                    
                     # Let's use the absolute highest scoring query's box as the Pseudo GT for this class
                     best_query_idx = topk_indices[0]
-                    # Make sure the pseudo GT box is NOT detached during mining if we want gradients, 
-                    # BUT here we want to regress pred_box towards pseudo_gt_box. 
-                    # If pseudo_gt_box is detached, pred_box gets gradients.
-                    pseudo_gt_box = bboxes[b, best_query_idx].detach() # [4]
+                    # Make sure the pseudo GT box is strictly detached to prevent gradients from flowing
+                    # back through the pseudo GT target.
+                    pseudo_gt_box = bboxes[b, best_query_idx].detach().clone() # [4]
                     
                     # We force the top K queries to regress towards the best pseudo GT box.
-                    # Note: If K=1, pred_box == pseudo_gt_box, so L1 loss is 0.
-                    # We should compute loss against other spatial targets or use K > 1.
                     for k_idx in topk_indices:
                         if k_idx != best_query_idx:
                             pred_box = bboxes[b, k_idx] # [4]
                             box_loss = box_loss + self.l1_loss(pred_box, pseudo_gt_box)
                             valid_box_pairs += 1
-                        else:
-                            # To ensure gradients flow to the best query itself, we could 
-                            # pull it towards a slightly perturbed version or use a different strategy.
-                            # For dummy test purpose, let's just make sure it gets a non-zero gradient 
-                            # by penalizing its size (dummy logic) or we can just set K=3 in init.
-                            pass
                         
             if valid_box_pairs > 0:
                 box_loss = box_loss / valid_box_pairs
