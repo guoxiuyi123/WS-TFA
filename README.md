@@ -1,94 +1,95 @@
-# 🎯 PRM-DETR: Point-to-Region Mamba-DETR for Weakly Supervised Small Object Detection
+# WS-TFA: Weakly Supervised Transformer-Fusion Attention for Tiny Object Detection
 
-![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)
-![Status](https://img.shields.io/badge/Status-Active-success.svg?style=for-the-badge)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-This is the official PyTorch implementation of **PRM-DETR**, a cutting-edge framework designed specifically for **Weakly Supervised Small Object Detection (WSSOD)** using only **Point Annotations**.
+> Official PyTorch implementation of the paper **WS-TFA: Weakly Supervised Transformer-Fusion Attention for Tiny Object Detection**.
 
-## 📖 Abstract / Introduction
-Detecting extremely small objects is notoriously challenging, and the problem is further exacerbated when only point annotations (without bounding box width and height) are available. Traditional bounding box-based regressors and IoU metrics fail in this weakly supervised scenario.
+## Abstract
+Weakly Supervised Object Detection (WSOD) relies solely on image-level labels to train object detectors. Traditional approaches suffer severely from the **"Local Dominance"** problem—where networks focus only on the most discriminative parts of an object (e.g., a dog's head) rather than its full extent—and **"Gradient Submergence"**, which causes tiny objects to be ignored during feature propagation.
 
-**PRM-DETR** introduces a fully decoupled and innovative architecture to tackle these challenges:
-1. **Mamba-driven High-Resolution Processing**: We utilize a Mamba encoder to efficiently model global dependencies on the high-resolution P2 feature map, preventing the typical memory explosion while capturing crucial fine-grained details of small objects.
-2. **Dynamic Boundary Perception**: By integrating `DynamicSnakeConv`, the network dynamically perceives irregular boundaries of targets directly from point priors.
-3. **KAN-enhanced Classification**: We replace the traditional MLP classification head with a Kolmogorov-Arnold Legendre Network (`KALNConv`), leveraging its superior high-order non-linear fitting capabilities to distinguish extremely weak small object features from massive backgrounds.
-4. **Point-based Hungarian Matching**: We completely rewrite the DETR matching mechanism, abandoning IoU and L1 box costs in favor of a pure **L2 Distance Cost** combined with Focal Loss, ensuring stable bipartite matching solely from point supervision.
+To address these challenges, we introduce **WS-TFA** (Weakly Supervised Transformer-Fusion Attention). Our framework seamlessly integrates a dynamic attention-based feature pyramid with a sparse Multiple Instance Learning (MIL) head, achieving state-of-the-art performance, especially on tiny objects.
 
-## 🚀 Highlights (Contributions)
-- 🐍 **Hybrid Mamba-Snake Encoder**: A novel neck design combining `MobileMamba` for global context and `DynamicSnakeConv` for dynamic region expansion.
-- 🧠 **KAN Decoder Head**: Integrating high-order Legendre polynomial networks (`KALNConv`) into the transformer decoder for robust weak-feature classification.
-- 🎯 **Pure Point-Matching Engine**: A customized Hungarian Matcher and Criterion tailored for point annotations, discarding all box-dependent constraints.
-- 🧩 **Point-Level Data Augmentation**: Innovative `PointCopyPaste` and `PointMosaic` techniques designed to enrich small object samples and stabilize early-stage matching.
+## Architecture
 
-## 🛠️ Installation
+![Architecture](docs/architecture.png)
+
+The WS-TFA architecture consists of three core components:
+
+1. **Feature Supplement Module (FSM)**:
+   Extracts high-resolution geometric details from shallow layers (C1) using dilated convolutions and adaptively supplements them into semantically rich deep layers to prevent tiny object feature loss.
+
+2. **Dynamic Attention FPN**:
+   Replaces the traditional 1:1 addition in FPNs. It learns a dynamic spatial weight factor $\alpha$ to adaptively fuse deep semantic features with shallow detailed features.
+
+3. **Sparse MIL Head**:
+   Combines a Class-Agnostic DETR-like proposal generator with a novel `Sparsemax` MIL classifier. By enforcing sparsity across object queries, it aggressively suppresses low-confidence noisy proposals and effectively mitigates the local dominance issue.
+
+## Installation
+
+Clone the repository and install the required dependencies:
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/PRM-DETR.git
-cd PRM-DETR
+git clone https://github.com/yourusername/WS-TFA.git
+cd WS-TFA
 
 # Create a virtual environment (optional but recommended)
-conda create -n prm_detr python=3.10
-conda activate prm_detr
+conda create -n wstfa python=3.9 -y
+conda activate wstfa
 
 # Install dependencies
-pip install torch torchvision torchaudio
-pip install scipy numpy opencv-python einops PyWavelets
+pip install -r requirements.txt
 ```
-*(Note: Mamba and Triton dependencies are required for optimal performance on GPU. The code currently falls back to native PyTorch implementations if Triton is not available.)*
 
-## ⚡ Quick Start
+## Quick Start
 
-You can instantly experience the architecture and verify the entire training pipeline (Forward, Point Matching, Loss Calculation, and Point AP Evaluation) using our mock data script.
+### 1. Verify Model Connectivity (Dummy Training)
+We provide a dummy training script to verify the forward pass, backward pass, and the Pseudo-Label Mining box regression loss mechanism.
 
 ```bash
-python tools/train.py
+python train_dummy.py
+```
+*Expected Output:* You should see the loss decreasing and a confirmation that the computation graph is fully connected (no zero gradients in the Box Head after the Warm-up epochs).
+
+### 2. Generate Academic Visualizations
+To see how WS-TFA overcomes local dominance, you can extract the `P2_prime` attention heatmaps overlaid on the original image.
+
+```bash
+python visualize.py
+```
+*Expected Output:* A high-resolution figure (`paper_figure_1.png`) will be saved in the root directory, showcasing both the final bounding boxes and the extracted spatial attention heatmap.
+
+### 3. Data Pipeline Test
+To verify the WSOD data augmentations (specifically the `CoarseDropout`/Cutout mechanism that forces the network to learn global representations):
+
+```bash
+python test_dataloader.py
 ```
 
-Expected output:
-```text
-Using device: cuda (or cpu)
-Starting training loop...
-Epoch [1/5] | loss_ce: 3.4620 | loss_point: 0.2123 | Total Loss: 3.6743
-Running validation...
-====== Point-based Evaluation ======
-  AP@0.01px : 0.0000
-  AP@0.05px : 0.0018
-  AP@0.1px : 0.0562
-  mAP     : 0.0193
-====================================
-...
-Training loop finished successfully!
+## TODO / Roadmap
+
+- [x] Core Architecture (Backbone, FSM, Dynamic FPN)
+- [x] Sparse MIL Detection Head
+- [x] Pseudo-Label Mining & Box Regression Loss
+- [x] Academic Visualization Pipeline
+- [ ] Integrate PASCAL VOC 2007 dataset loader
+- [ ] Add mAP evaluation script
+- [ ] Release pre-trained weights
+
+## Citation
+
+If you find this project useful for your research, please consider citing our paper:
+
+```bibtex
+@article{wstfa2026,
+  title={WS-TFA: Weakly Supervised Transformer-Fusion Attention for Tiny Object Detection},
+  author={},
+  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  year={2026}
+}
 ```
 
-## 📁 Project Structure
+## License
 
-PRM-DETR features an extremely clean, highly decoupled architecture:
-
-```text
-PRM-DETR/
-├── configs/                 # YAML configuration files
-├── dataset/                 # Dataset loaders and Point-Level Augmentations
-│   ├── point_dataset.py     # PointSupervisedDataset
-│   └── transforms.py        # PointCopyPaste & PointMosaic
-├── engine/                  # Core training mechanisms
-│   ├── criterion.py         # PointCriterion (Focal + Smooth L1 Distance)
-│   └── matcher.py           # PointMatcher (L2 Distance Bipartite Matching)
-├── models/                  # Network architecture
-│   ├── backbone/            # Multi-scale feature extractors
-│   ├── head/                # PRMDecoder with KAN Classification Head
-│   ├── neck/                # HybridEncoderPRM
-│   ├── ops/                 # Decoupled Core Operators
-│   │   ├── kan/             # KALNConv (Kolmogorov-Arnold Networks)
-│   │   ├── mamba/           # MobileMambaBlock
-│   │   └── snake_conv/      # DynamicSnakeConv
-│   └── prm_detr.py          # Top-level PRMDETR entry point
-├── tools/                   # Execution scripts
-│   └── train.py             # Main training loop
-└── utils/                   # Utilities
-    └── metrics.py           # PointEvaluator (Point AP / Location Recall)
-```
-
-## 📄 License
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the [MIT License](LICENSE).

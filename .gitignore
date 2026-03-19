@@ -1,52 +1,36 @@
-# --- 1. 数据集相关 (Data) ---
-# 目标检测的数据集通常极大，绝对不要上传到 GitHub
-data/
-datasets/
-VOCdevkit/
-coco/
-*.zip
-*.tar
-*.gz
-
-# --- 2. 模型权重与输出 (Weights & Outputs) ---
-# 训练产生的模型文件（.pt, .pth, .weights, .onnx, .pb）
-*.pt
-*.pth
-*.weights
-*.onnx
-*.pb
-*.tflite
-*.engine
-
-# 训练日志与结果文件夹（如 YOLO 的 runs/ 或 MMDetection 的 work_dirs/）
-runs/
-work_dirs/
-exp/
-logs/
-*.log
-checkpoint/
-
-# --- 3. Python 环境与缓存 (Python) ---
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# PyTorch
+*.pth
+*.pt
+checkpoints/
+runs/
+
+# Data and results
+data/
+dummy_voc/
+paper_figure_*.png
+test_augmentation.jpg
+outputs/
+results/
+
+# Environments
 .env
 .venv
 env/
 venv/
 ENV/
-build/
-dist/
-*.egg-info/
+env.bak/
+venv.bak/
 
-# --- 4. 编译器与 IDE 相关 (IDE) ---
-# 排除 VS Code 的本地配置
+# IDE and OS
 .vscode/
-# 如果你偶尔用 PyCharm
 .idea/
 .DS_Store
+*.swp
 
-# --- 5. 标注工具产生的文件 (Annotation Tools) ---
-# 比如 LabelImg 的配置或临时备份
-classes.txt
-.ipynb_checkpoints/
+# Jupyter Notebook
+.ipynb_checkpoints
