@@ -260,18 +260,25 @@ class SparseMILHead(nn.Module):
 
         # 2. Sparsemax MIL Classifier
         mil_logits = self.mil_classifier(hs) # [B, 300, Num_Classes]
+        # In testing phase, Sparsemax can be too aggressive if the model hasn't fully converged.
+        # It forces almost everything to exact 0. We can fall back to softmax for testing 
+        # or stick to sparsemax if fully trained. Let's see what mil_probs look like.
         mil_probs = self.sparsemax(mil_logits) # [B, 300, Num_Classes]
 
         # 3. Joint Probability Estimation
         # Final_Prob = MIL_Prob * Objectness_Scores
         # This suppresses proposals that have high MIL score (local discriminative part) 
         # but low objectness (not a complete object).
-        final_prob = mil_probs * objectness_scores
-
+        # We also clamp to avoid exact 0s which might cause issues downstream.
+        final_prob = (mil_probs * objectness_scores).clamp(min=1e-8, max=1.0)
+        
+        # If in eval mode and everything is clamped to 1e-8, it means Sparsemax killed everything
+        # or Objectness is exactly 0. Let's return raw logits too for debugging if needed.
         return {
             "bboxes": bboxes,
             "objectness_scores": objectness_scores,
             "mil_probs": mil_probs,
+            "mil_logits": mil_logits,
             "final_prob": final_prob
         }
 
